@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+#
+# `pvtr publish` reads the output of this build (dist/artifacts.json and
+# dist/metadata.json) to assemble the plugin's OCI index for grc.store.
+version: 2
+
+project_name: plugin-example
+
+builds:
+  - id: plugin-example
+    # The go-plugin entrypoint name pvtr installs and runs the plugin as.
+    binary: plugin-example
+    env:
+      - CGO_ENABLED=0
+    # goos/goarch are left at GoReleaser's defaults (linux, darwin, windows;
+    # 386, amd64, arm64), as they were before this file existed.
+    ldflags:
+      - -s -w
+      - -X main.Version={{ .Version }}
+      - -X main.VersionPostfix=
+      - -X main.GitCommitHash={{ .ShortCommit }}
+      - -X main.BuiltAt={{ .Date }}
+
+snapshot:
+  # Untagged (workflow_dispatch) builds get a unique pre-release version, so
+  # re-running the publish workflow never collides with an existing version on
+  # the hub. Example: 0.2.1-dev.1762790400
+  version_template: "{{ incpatch .Version }}-dev.{{ .Timestamp }}"
