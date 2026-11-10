@@ -27,6 +27,18 @@ var (
 	PluginName   = "plugin-example"
 	RequiredVars = []string{}
 
+	// Publisher is the grc.store namespace that owns this plugin. With
+	// PluginName it forms the publish coordinate <Publisher>/<PluginName>.
+	// Only `pvtr publish` reads it; it can be overridden at build time with
+	// -ldflags "-X main.Publisher=<namespace>".
+	Publisher = "zainawan9175"
+	// License is the SPDX expression grc.store records for this plugin.
+	License = "Apache-2.0"
+	// CatalogNamespace is the grc.store namespace that owns the embedded
+	// CCC.ObjStor catalog. The catalog's metadata.author.id is empty, so
+	// publishing needs this to link the plugin to the catalog's real owner.
+	CatalogNamespace = "finos-ccc"
+
 	//go:embed data/catalogs
 	files   embed.FS
 	dataDir = filepath.Join("data", "catalogs")
@@ -41,6 +53,11 @@ func main() {
 		PluginName:    PluginName,
 		PluginVersion: Version,
 		PluginUri:     "github.com/privateerproj/plugin-example",
+		Publisher:     Publisher,
+		License:       License,
+		CatalogNamespaces: map[string]string{
+			"CCC.ObjStor": CatalogNamespace,
+		},
 	}
 	orchestrator.AddLoader(data.Loader)
 
