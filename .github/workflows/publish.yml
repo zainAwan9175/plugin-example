@@ -1,0 +1,256 @@
+---
+# Publishes this plugin to a grc.store hub with `pvtr publish`: GoReleaser
+# builds it, pvtr pushes the OCI index to the hub's registry, signs it with
+# Sigstore keyless signing, and asks the hub to sync (ingest and verify) it.
+name: Publish to grc.store
+
+on:
+  workflow_dispatch:
+    inputs:
+      hub-url:
+        description: >-
+          https://hub.grc.store or https://hub.preview.grc.store. Leave empty
+          to use the PVTR_HUB_URL repository variable, or https://hub.grc.store
+          when that is unset.
+        required: false
+        default: ""
+        type: string
+      mode:
+        description: >-
+          publish: push, sign and sync. no-sync: push only, no signing.
+          local-registry: push to a throwaway registry inside the job
+          (no hub, no token).
+        required: true
+        default: publish
+        type: choice
+        options:
+          - publish
+          - no-sync
+          - local-registry
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PVTR_VERSION: v0.24.2
+  # install.sh from the commit tagged v0.24.2, checked against its SHA-256
+  # before it runs.
+  PVTR_INSTALL_SH_URL: https://raw.githubusercontent.com/privateerproj/pvtr/5998ab374a65786dd1c86a0de1976ca794e0eaaf/install.sh
+  PVTR_INSTALL_SH_SHA256: 66d10b06df279f8e23019b33c55dfca6cbd2cf8c995b5617faf4e8e563137ae6
+  GORELEASER_VERSION: v2.20.0
+  # Only used by mode=local-registry.
+  REGISTRY_IMAGE: registry:3.0.0@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # check out the code
+      id-token: write # GitHub OIDC tokens: Sigstore signing, and trusted publishing
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Resolve settings
+        env:
+          INPUT_HUB_URL: ${{ inputs.hub-url }}
+          VAR_HUB_URL: ${{ vars.PVTR_HUB_URL }}
+          INPUT_MODE: ${{ inputs.mode }}
+        run: |
+          hub_url="${INPUT_HUB_URL:-${VAR_HUB_URL:-https://hub.grc.store}}"
+          hub_url="${hub_url%/}"
+          # A tag push has no inputs, so it always does a full publish.
+          mode="${INPUT_MODE:-publish}"
+          # Only the two grc.store hubs, as in revanite-io/pvtr-publish-results:
+          # the hub receives this workflow's OIDC tokens, so it is not free-form.
+          case "$hub_url" in
+            https://hub.grc.store | https://hub.preview.grc.store) ;;
+            *)
+              echo "::error title=Invalid hub URL::The hub URL must be https://hub.grc.store or https://hub.preview.grc.store (not the website https://preview.grc.store)"
+              exit 1
+              ;;
+          esac
+          case "$mode" in
+            publish | no-sync | local-registry) ;;
+            *)
+              echo "::error title=Invalid mode::mode must be publish, no-sync or local-registry"
+              exit 1
+              ;;
+          esac
+          {
+            echo "PVTR_HUB_URL=$hub_url"
+            echo "PUBLISH_MODE=$mode"
+          } >> "$GITHUB_ENV"
+          echo "Hub:  $hub_url"
+          echo "Mode: $mode"
+
+      - name: Check the hub is reachable
+        if: env.PUBLISH_MODE != 'local-registry'
+        run: |
+          if ! discovery="$(curl -fsS --retry 3 "$PVTR_HUB_URL/.well-known/grc-store-configuration")" \
+            || ! jq -e '.registry_url' <<< "$discovery" > /dev/null; then
+            echo "::error title=Hub not reachable::No grc.store discovery document at $PVTR_HUB_URL. Is the hub up, and is this the hub API URL (for example https://hub.preview.grc.store, not https://preview.grc.store)?"
+            exit 1
+          fi
+          jq '{hub_url, registry_url, ci_audience}' <<< "$discovery"
+
+      - name: Check hub credentials
+        if: env.PUBLISH_MODE != 'local-registry'
+        env:
+          PVTR_TOKEN_SECRET: ${{ secrets.PVTR_TOKEN }}
+        run: |
+          if [[ -n "$PVTR_TOKEN_SECRET" ]]; then
+            echo "Hub token: the PVTR_TOKEN repository secret."
+          elif [[ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "::notice title=No PVTR_TOKEN secret::Using this workflow's GitHub OIDC token as the hub token (trusted publishing). The hub must trust $GITHUB_REPOSITORY for the plugin's namespace."
+          else
+            echo "::error title=No hub token::Set the PVTR_TOKEN repository secret, or give the job 'permissions: id-token: write' for trusted publishing."
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # GoReleaser derives the version from git tags
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false # no shared build cache in a publishing job
+
+      - name: Build with GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: ${{ env.GORELEASER_VERSION }}
+          # A tag builds that version; anything else is a snapshot with a
+          # unique pre-release version (see .goreleaser.yaml).
+          args: build ${{ github.ref_type == 'tag' && '--clean' || '--clean --snapshot' }}
+
+      - name: Check the plugin's publish manifest
+        id: manifest
+        run: |
+          bin="$(jq -r '.[] | select(.type == "Binary" and .goos == "linux" and .goarch == "amd64") | .path' dist/artifacts.json)"
+          if [[ -z "$bin" ]]; then
+            echo "::error::No linux/amd64 binary in dist/artifacts.json"
+            exit 1
+          fi
+          "./$bin" publish-manifest | tee "$RUNNER_TEMP/publish-manifest.json"
+          coordinate="$(jq -r '.coordinate' "$RUNNER_TEMP/publish-manifest.json")"
+          version="$(jq -r '.version' dist/metadata.json)"
+          echo "Will publish $coordinate version $version"
+          {
+            echo "coordinate=$coordinate"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install pvtr
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/install.sh" "$PVTR_INSTALL_SH_URL"
+          echo "$PVTR_INSTALL_SH_SHA256  $RUNNER_TEMP/install.sh" | sha256sum -c -
+          bash "$RUNNER_TEMP/install.sh" -v "$PVTR_VERSION" -p "$RUNNER_TEMP/pvtr-bin"
+          echo "$RUNNER_TEMP/pvtr-bin" >> "$GITHUB_PATH"
+
+      - name: Check pvtr is on PATH
+        run: |
+          command -v pvtr
+          installed="$(pvtr version)"
+          if [[ "$installed" != "${PVTR_VERSION#v}" ]]; then
+            echo "::error::Expected pvtr ${PVTR_VERSION#v}, got $installed"
+            exit 1
+          fi
+          echo "pvtr $installed"
+
+      - name: Publish to a throwaway local registry
+        if: env.PUBLISH_MODE == 'local-registry'
+        run: |
+          docker run --detach --name registry --publish 127.0.0.1:5000:5000 "$REGISTRY_IMAGE"
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:5000/v2/ > /dev/null && break
+            sleep 1
+          done
+          pvtr publish --dist dist --registry http://127.0.0.1:5000
+          curl -fsS http://127.0.0.1:5000/v2/_catalog
+
+      - name: Publish with pvtr
+        if: env.PUBLISH_MODE != 'local-registry'
+        env:
+          PVTR_TOKEN_SECRET: ${{ secrets.PVTR_TOKEN }}
+        run: |
+          if [[ -n "$PVTR_TOKEN_SECRET" ]]; then
+            PVTR_TOKEN="$PVTR_TOKEN_SECRET"
+          else
+            # Trusted publishing: request this workflow's GitHub OIDC token for
+            # the audience the hub advertises (ci_audience), falling back to the
+            # hub URL, as grc-store-clientkit's hub.CIBearer does.
+            audience="$(curl -fsS "$PVTR_HUB_URL/.well-known/grc-store-configuration" | jq -r '.ci_audience // empty')"
+            audience="${audience:-$PVTR_HUB_URL}"
+            echo "Requesting a GitHub OIDC token for audience $audience"
+            sep="?"
+            if [[ "$ACTIONS_ID_TOKEN_REQUEST_URL" == *"?"* ]]; then sep="&"; fi
+            PVTR_TOKEN="$(curl -fsS \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}${sep}audience=$(jq -rn --arg a "$audience" '$a | @uri')" \
+              | jq -r '.value // empty')"
+            if [[ -z "$PVTR_TOKEN" ]]; then
+              echo "::error::GitHub returned no OIDC token"
+              exit 1
+            fi
+            echo "::add-mask::$PVTR_TOKEN"
+          fi
+          export PVTR_TOKEN
+
+          args=(publish --dist dist --hub-url "$PVTR_HUB_URL")
+          if [[ "$PUBLISH_MODE" == "no-sync" ]]; then
+            args+=(--no-sync)
+          fi
+          if ! pvtr "${args[@]}"; then
+            echo "::error title=pvtr publish failed::See the log above. If the hub rejected the token, set the PVTR_TOKEN secret or ask the hub admin to trust $GITHUB_REPOSITORY as a publisher. If it says you do not own the namespace, claim it on the hub first."
+            exit 1
+          fi
+
+      - name: Verify the release on the hub
+        if: env.PUBLISH_MODE == 'publish'
+        env:
+          COORDINATE: ${{ steps.manifest.outputs.coordinate }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          detail="$(curl -fsS "$PVTR_HUB_URL/v1/plugins/$COORDINATE")"
+          jq --arg v "$VERSION" '{signer_identity, release: (.releases[] | select(.version == $v))}' <<< "$detail"
+          if ! jq -e --arg v "$VERSION" '.releases[] | select(.version == $v and .signed == true)' <<< "$detail" > /dev/null; then
+            echo "::error::The hub does not list $COORDINATE $VERSION as a signed release"
+            exit 1
+          fi
+          # Installing checks the Sigstore signature and refuses an unverified binary.
+          pvtr install "$COORDINATE@$VERSION" --hub-url "$PVTR_HUB_URL" --binaries-path "$RUNNER_TEMP/verify-plugins"
+
+      - name: Summary
+        env:
+          COORDINATE: ${{ steps.manifest.outputs.coordinate }}
+          VERSION: ${{ steps.manifest.outputs.version }}
+        run: |
+          {
+            echo "### pvtr publish"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Plugin | \`$COORDINATE\` |"
+            echo "| Version | \`$VERSION\` |"
+            echo "| Mode | \`$PUBLISH_MODE\` |"
+            if [[ "$PUBLISH_MODE" != "local-registry" ]]; then
+              echo "| Hub | $PVTR_HUB_URL |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
